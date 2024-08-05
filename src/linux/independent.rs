@@ -251,3 +251,112 @@ impl Distro for ChimeraLinux {
             .into()
     }
 }
+
+const GENTOO_MIRROR: &str = "https://distfiles.gentoo.org/releases/";
+
+pub struct Gentoo;
+impl Distro for Gentoo {
+    const NAME: &'static str = "gentoo";
+    const PRETTY_NAME: &'static str = "Gentoo";
+    const HOMEPAGE: Option<&'static str> = Some("https://www.gentoo.org/");
+    const DESCRIPTION: Option<&'static str> = Some("Highly flexible, source-based Linux distribution.");
+    async fn generate_configs() -> Option<Vec<Config>> {
+        let iso_regex = Arc::new(Regex::new(r#"\d{8}T\d{6}Z\/(admincd|install|livegui).*?.iso"#).unwrap());
+        let futures = [(Arch::x86_64, "amd64"), (Arch::aarch64, "arm64")]
+            .into_iter()
+            .map(|(arch, arch_str)| {
+                let iso_regex = iso_regex.clone();
+                let mirror = format!("{GENTOO_MIRROR}{arch_str}/autobuilds/");
+                async move {
+                    let image_data = capture_page(&(mirror.clone() + "latest-iso.txt")).await?;
+
+                    let futures = iso_regex
+                        .captures_iter(&image_data)
+                        .map(|c| c.extract())
+                        .map(|(iso, [mut edition])| {
+                            if edition == "install" {
+                                edition = "minimal";
+                            }
+                            let url = format!("{mirror}{iso}");
+                            let checksum_url = url.clone() + ".sha256";
+                            let arch = arch.clone();
+                            async move {
+                                let checksum = capture_page(&checksum_url).await.and_then(|cs| {
+                                    cs.lines()
+                                        .find(|l| l.contains("iso"))
+                                        .and_then(|l| l.split_whitespace().next().map(ToString::to_string))
+                                });
+
+                                Config {
+                                    release: Some("latest".to_string()),
+                                    edition: Some(edition.to_string()),
+                                    iso: Some(vec![Source::Web(WebSource::new(url, checksum, None, None))]),
+                                    arch,
+                                    ..Default::default()
+                                }
+                            }
+                        });
+
+                    Some(futures::future::join_all(futures).await)
+                }
+            });
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<Config>>()
+            .into()
+    }
+}
+
+const GNOMEOS_MIRROR: &str = "https://download.gnome.org/gnomeos/";
+
+pub struct GnomeOS;
+impl Distro for GnomeOS {
+    const NAME: &'static str = "gnomeos";
+    const PRETTY_NAME: &'static str = "GNOME OS";
+    const HOMEPAGE: Option<&'static str> = Some("https://os.gnome.org/");
+    const DESCRIPTION: Option<&'static str> = Some("Alpha nightly bleeding edge distro of GNOME");
+    async fn generate_configs() -> Option<Vec<Config>> {
+        let release_html = capture_page(GNOMEOS_MIRROR).await?;
+        let release_regex = Regex::new(r#"href="(\d[^/]+)\/""#).unwrap();
+        let iso_regex = Arc::new(Regex::new(r#"href="(gnome_os.*?.iso)""#).unwrap());
+
+        let mut releases = release_regex
+            .captures_iter(&release_html)
+            .map(|r| (r[1].to_string(), format!("{GNOMEOS_MIRROR}{}/", &r[1])))
+            .collect::<Vec<_>>();
+        releases.reverse();
+
+        let futures = releases.into_iter().take(6).map(|(release, mirror)| {
+            let iso_regex = iso_regex.clone();
+            async move {
+                let page = capture_page(&mirror).await?;
+                let iso = &iso_regex.captures(&page)?[1];
+                let url = format!("{mirror}{iso}");
+                Some(Config {
+                    release: Some(release),
+                    iso: Some(vec![Source::Web(WebSource::url_only(url))]),
+                    ..Default::default()
+                })
+            }
+        });
+
+        let mut configs = futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<Config>>();
+
+        configs.push(Config {
+            release: Some("nightly".to_string()),
+            iso: Some(vec![Source::Web(WebSource::url_only(
+                "https://os.gnome.org/download/latest/gnome_os_installer.iso",
+            ))]),
+            ..Default::default()
+        });
+
+        Some(configs)
+    }
+}
